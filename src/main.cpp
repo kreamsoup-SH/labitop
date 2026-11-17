@@ -433,12 +433,13 @@ struct UiState {
 double frac_of(uint64_t used, uint64_t total) { return total ? (double)used / (double)total : 0.0; }
 std::string used_of(uint64_t used, uint64_t total) { return fmt_bytes(used) + " / " + fmt_bytes(total); }
 
-// Core grid: at most 4 rows when the cells stay readable, more rows otherwise.
+// Core grid: cells wide enough to show a percentage (13 columns) when that needs at most 6 rows,
+// otherwise compact cells with the bar only.
 int core_grid(int n, int inner, int& cols) {
     cols = 1;
     if (n <= 0 || inner <= 0) return 0;
-    cols = (n + 3) / 4;
-    if (inner / cols < 7) cols = std::max(1, inner / 7);
+    cols = std::min(n, std::max(1, inner / 13));
+    if ((n + cols - 1) / cols > 6) cols = std::min(n, std::max(1, inner / 7));
     return (n + cols - 1) / cols;
 }
 
@@ -671,16 +672,20 @@ void procs_draw(Canvas& c, View& v, UiState& ui, int x, int y, int w, int h) {
 struct Panel {
     int (*pref)(const View&, int w, int g);
     void (*draw)(Canvas&, const View&, int x, int y, int w, int h, int g);
-    int weight;
+    int weight;  // share of the row's width
+    bool major;  // gets full-height history graphs; the others get half
 };
-const Panel kCpu = { cpu_pref, cpu_draw, 3 }, kMem = { mem_pref, mem_draw, 2 }, kGpu = { gpu_pref, gpu_draw, 1 },
-            kDisk = { disk_pref, disk_draw, 1 }, kNet = { net_pref, net_draw, 1 };
+// Importance: CPU = GPU >= Memory > Storage > Network >>> Processes.
+// CPU and GPU share the top row equally; the second row is split 5 : 4 : 3.
+const Panel kCpu = { cpu_pref, cpu_draw, 1, true }, kGpu = { gpu_pref, gpu_draw, 1, true },
+            kMem = { mem_pref, mem_draw, 5, false }, kDisk = { disk_pref, disk_draw, 4, false },
+            kNet = { net_pref, net_draw, 3, false };
 
-// Panels per row, depending on the terminal width.
+// Panels per row, most important first, depending on the terminal width.
 std::vector<std::vector<Panel>> layout(int W) {
-    if (W >= 120) return { { kCpu, kMem }, { kGpu, kDisk, kNet } };
-    if (W >= 80) return { { kCpu }, { kMem, kGpu }, { kDisk, kNet } };
-    return { { kCpu }, { kMem }, { kGpu }, { kDisk }, { kNet } };
+    if (W >= 120) return { { kCpu, kGpu }, { kMem, kDisk, kNet } };
+    if (W >= 80) return { { kCpu, kGpu }, { kMem, kDisk }, { kNet } };
+    return { { kCpu }, { kGpu }, { kMem }, { kDisk }, { kNet } };
 }
 
 // `full` prints every process with no key help (used by --once); H is ignored then.
@@ -706,20 +711,38 @@ std::vector<std::string> render(View& v, UiState& ui, const std::string& host, i
         placed.push_back(std::move(pr));
     }
 
-    // Shrink the history graphs until the process list has room. A one-shot frame has no history.
-    int g = full ? 0 : 4, top = 0;
+    // Graph height per row: rows holding CPU or GPU get g, the rest half of it.
+    auto row_g = [&](size_t r, int g) {
+        for (auto& pl : placed[r])
+            if (pl.p->major) return g;
+        return (g + 1) / 2;
+    };
     std::vector<int> heights;
-    for (;; g--) {
+    auto measure = [&](int g) { // total height of the title line plus all panel rows
         heights.clear();
-        top = 1; // title line
-        for (auto& pr : placed) {
+        int top = 1;
+        for (size_t r = 0; r < placed.size(); r++) {
             int hmax = 0;
-            for (auto& pl : pr) hmax = std::max(hmax, pl.p->pref(v, pl.w, g));
+            for (auto& pl : placed[r]) hmax = std::max(hmax, pl.p->pref(v, pl.w, row_g(r, g)));
             heights.push_back(hmax);
             top += hmax;
         }
-        if (full || g == 0 || H - top - 1 >= 8) break;
+        return top;
+    };
+
+    // The process list matters least: it gets a small fixed share when graphs of at least 2 rows
+    // still fit beside it, and otherwise only what the panels leave over. A one-shot frame has
+    // no history, so it has no graphs.
+    const int kMaxGraph = 12, kProcLines = 8;
+    int g = 0;
+    if (!full) {
+        g = -1;
+        for (int t = kMaxGraph; t >= 2 && g < 0; t--)
+            if (measure(t) + 1 + kProcLines <= H) g = t;
+        for (int t = kMaxGraph; t >= 0 && g < 0; t--)
+            if (measure(t) + 1 <= H || t == 0) g = t;
     }
+    int top = measure(g);
     int proc_h = full ? (int)v.procs.size() + 3 : H - top - 1;
     if (full) H = top + proc_h;
 
@@ -735,7 +758,7 @@ std::vector<std::string> render(View& v, UiState& ui, const std::string& host, i
     for (size_t r = 0; r < placed.size(); r++) {
         for (auto& pl : placed[r]) {
             c.unclip();
-            pl.p->draw(c, v, pl.x, y, pl.w, heights[r], g);
+            pl.p->draw(c, v, pl.x, y, pl.w, heights[r], row_g(r, g));
         }
         y += heights[r];
     }
