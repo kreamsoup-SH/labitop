@@ -100,6 +100,7 @@ if ($Uninstall) {
 
 $exe = Join-Path $PSScriptRoot 'build\labitop.exe'
 if (Get-Command g++ -ErrorAction SilentlyContinue) {
+    $env:LABITOP_NOPAUSE = 1  # install.bat pauses once at the end; build.bat must not
     & cmd.exe /c "`"$PSScriptRoot\build.bat`""
     if ($LASTEXITCODE -ne 0) { throw 'Build failed; nothing was installed.' }
 } elseif (Test-Path $exe) {

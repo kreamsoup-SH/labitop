@@ -7,4 +7,7 @@ setlocal
 set ARGS=
 if /i "%~1"=="uninstall" set ARGS=-Uninstall
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %ARGS%
-exit /b %errorlevel%
+set RC=%errorlevel%
+rem Double-clicked (cmd /c): keep the window open until a key is pressed.
+echo %cmdcmdline% | find /i "/c" >nul && pause
+exit /b %RC%
