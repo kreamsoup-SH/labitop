@@ -132,7 +132,33 @@ C++17로 작성했고 외부 라이브러리를 쓰지 않습니다.
 
    테스트까지 빌드하고 실행하려면 `.\build.bat test`를 씁니다.
 
-3. `build\labitop.exe`가 생깁니다. 이 파일 하나만 다른 Windows PC로 복사해도 실행됩니다. 어디서나 실행하려면 `PATH`에 있는 폴더로 옮기세요.
+3. `build\labitop.exe`가 생깁니다. 이 파일 하나만 다른 Windows PC로 복사해도 실행됩니다.
+
+4. 어느 폴더에서나 `labitop` 명령으로 실행하려면 설치 스크립트를 실행합니다. 관리자 권한은 필요 없습니다.
+
+   ```powershell
+   .\install.bat
+   ```
+
+   스크립트가 하는 일:
+
+   - `build.bat`으로 새로 빌드합니다. g++가 없으면 이미 있는 `build\labitop.exe`를 그대로 씁니다.
+   - 실행 파일을 `%LOCALAPPDATA%\Programs\labitop\labitop.exe`로 복사합니다.
+   - 그 폴더를 **사용자** PATH에 추가합니다. 이미 있으면 그대로 둡니다. 시스템 PATH와 다른 항목은 건드리지 않습니다.
+
+   설치가 끝나면 **새 터미널**을 열고 `labitop`을 입력합니다. 이미 열려 있던 터미널은 예전 PATH를 그대로 갖고 있어서 명령을 찾지 못합니다.
+
+   코드를 고친 뒤 다시 `.\install.bat`을 실행하면 새 버전으로 바뀝니다. 설치된 labitop이 실행 중이면 복사가 실패하니 먼저 종료하세요.
+
+   제거:
+
+   ```powershell
+   .\install.bat uninstall
+   ```
+
+   PATH에서 그 폴더를 빼고 설치된 `labitop.exe`를 지웁니다. 저장소의 `build` 폴더는 그대로 둡니다.
+
+   수동으로 하려면 `labitop.exe`를 원하는 폴더에 두고, 시작 메뉴에서 "계정의 환경 변수 편집"을 열어 사용자 변수 `Path`에 그 폴더를 추가하면 됩니다.
 
 빌드가 `Permission denied`로 실패하면 실행 중인 labitop을 먼저 종료하세요. Windows는 실행 중인 파일을 덮어쓸 수 없습니다.
 
@@ -182,11 +208,21 @@ cmake --build build
    cmake --build build
    ```
 
-3. 원하면 시스템 경로에 설치합니다.
+3. 어느 폴더에서나 `labitop` 명령으로 실행하려면 설치 스크립트를 실행합니다.
 
    ```bash
-   sudo install -m 755 build/labitop /usr/local/bin/labitop
+   sh install.sh
    ```
+
+   빌드한 뒤 `~/.local/bin/labitop`으로 복사합니다. 대부분의 배포판은 `~/.local/bin`이 PATH에 들어 있습니다. 없으면 스크립트가 `~/.bashrc`(또는 `~/.zshrc`)에 넣을 줄을 알려 줍니다. 셸 설정 파일은 직접 고치지 않습니다.
+
+   모든 사용자용으로 `/usr/local/bin`에 설치하려면:
+
+   ```bash
+   sh build.sh && sudo PREFIX=/usr/local sh install.sh
+   ```
+
+   제거는 설치할 때와 같은 `PREFIX`로 `sh install.sh uninstall`(또는 `sudo PREFIX=/usr/local sh install.sh uninstall`)입니다.
 
 ## 사용법
 
@@ -203,11 +239,13 @@ labitop [-i 초] [--once] [--ascii]
 
 예시:
 
+설치 스크립트로 PATH에 등록했다면 어디서나 `labitop`으로, 아니면 저장소 폴더에서 `.\build\labitop.exe`(Linux는 `./build/labitop`)로 실행합니다.
+
 ```powershell
-.\build\labitop.exe              # 실시간 화면
-.\build\labitop.exe -i 0.5       # 0.5초마다 갱신
-.\build\labitop.exe --ascii      # 글자가 어긋나는 터미널용
-.\build\labitop.exe --once > snapshot.txt
+labitop                  # 실시간 화면
+labitop -i 0.5           # 0.5초마다 갱신
+labitop --ascii          # 글자가 어긋나는 터미널용
+labitop --once > snapshot.txt
 ```
 
 ### 키
@@ -299,4 +337,6 @@ Linux에서는 `sh build.sh test`, CMake로 빌드했다면 `ctest --test-dir bu
 | `tests/test.cpp` | 테스트 |
 | `build.bat` | Windows 빌드 스크립트 |
 | `build.sh` | Linux 빌드 스크립트 |
+| `install.bat`, `install.ps1` | Windows 설치·제거 스크립트 (사용자 PATH 등록) |
+| `install.sh` | Linux 설치·제거 스크립트 |
 | `CMakeLists.txt` | CMake 빌드 설정 |
