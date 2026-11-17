@@ -1,0 +1,23 @@
+# Build output: build.bat, build.sh and CMake all write here
+/build/
+
+# Other common CMake / IDE build folders
+/cmake-build-*/
+/out/
+
+# CMake files left behind by an in-source configure (cmake .)
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/Makefile
+/compile_commands.json
+
+# Compiled files, in case something is built outside build/
+*.exe
+*.o
+*.obj

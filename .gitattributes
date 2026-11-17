@@ -1,0 +1,4 @@
+# Keep the line endings each script needs, whatever the checkout settings are:
+# cmd.exe wants CRLF in batch files, and a CR after "#!/bin/sh" breaks shell scripts.
+*.bat text eol=crlf
+*.sh  text eol=lf
