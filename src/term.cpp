@@ -91,6 +91,11 @@ int term_read_key(int timeout_ms) {
             switch (k.wVirtualKeyCode) {
             case VK_UP: return K_UP;
             case VK_DOWN: return K_DOWN;
+            case VK_LEFT: return K_LEFT;
+            case VK_RIGHT: return K_RIGHT;
+            case VK_TAB:
+                if (k.dwControlKeyState & SHIFT_PRESSED) return K_BACKTAB;
+                break;
             case VK_PRIOR: return K_PGUP;
             case VK_NEXT: return K_PGDN;
             case VK_HOME: return K_HOME;
@@ -191,6 +196,9 @@ int term_read_key(int timeout_ms) {
         switch (buf[2]) {
         case 'A': return K_UP;
         case 'B': return K_DOWN;
+        case 'C': return K_RIGHT;
+        case 'D': return K_LEFT;
+        case 'Z': return K_BACKTAB; // Shift+Tab
         case 'H': return K_HOME;
         case 'F': return K_END;
         case '5': return K_PGUP;

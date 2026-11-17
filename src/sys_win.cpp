@@ -19,7 +19,9 @@
 #include "sys.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
+#include <cwctype>
 
 namespace {
 
@@ -354,6 +356,61 @@ void load_adapters() {
     factory->Release();
 }
 
+// "VideoDecode" -> "Decode", "Compute_1" -> "Compute", ...
+std::string engine_label(std::wstring eng) {
+    size_t us = eng.find_last_of(L'_');
+    if (us != std::wstring::npos && us + 1 < eng.size() && iswdigit(eng[us + 1])) eng.erase(us);
+    static const struct { const wchar_t* from; const char* to; } names[] = {
+        { L"3D", "3D" }, { L"Compute", "Compute" }, { L"Copy", "Copy" }, { L"VideoDecode", "Decode" },
+        { L"VideoEncode", "Encode" }, { L"VideoProcessing", "VideoProc" }, { L"JPEG_Decode", "JPEG" },
+    };
+    for (auto& n : names)
+        if (_wcsicmp(eng.c_str(), n.from) == 0) return n.to;
+    return utf8(eng.c_str());
+}
+
+// Which GPU APIs a process has loaded. Returns GpuUse flags; 0 when nothing matched or the
+// process cannot be read (elevated and protected processes, for example).
+uint8_t scan_modules(uint32_t pid) {
+    static const wchar_t* const compute[] = { L"nvcuda.dll", L"opencl.dll", L"amdhip64", L"ze_loader.dll", L"directml.dll" };
+    static const wchar_t* const graphics[] = { L"d3d9.dll", L"d3d10.dll", L"d3d10_1.dll", L"d3d11.dll",
+                                               L"d3d12.dll", L"opengl32.dll", L"vulkan-1.dll" };
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return 0;
+    std::vector<HMODULE> mods(1024);
+    DWORD bytes = 0;
+    uint8_t use = 0;
+    if (EnumProcessModulesEx(h, mods.data(), (DWORD)(mods.size() * sizeof(HMODULE)), &bytes, LIST_MODULES_ALL)) {
+        size_t n = std::min(mods.size(), (size_t)bytes / sizeof(HMODULE));
+        for (size_t i = 0; i < n && use != (GPU_COMPUTE | GPU_GRAPHICS); i++) {
+            wchar_t name[MAX_PATH];
+            if (!GetModuleBaseNameW(h, mods[i], name, MAX_PATH)) continue;
+            for (const wchar_t* m : compute)
+                if (_wcsnicmp(name, m, wcslen(m)) == 0) use |= GPU_COMPUTE;
+            for (const wchar_t* m : graphics)
+                if (_wcsicmp(name, m) == 0) use |= GPU_GRAPHICS;
+        }
+    }
+    CloseHandle(h);
+    return use;
+}
+
+// Reading another process's module list is slow, so each result is kept for 10 seconds
+// (programs such as PyTorch load CUDA some time after they start).
+struct ModuleInfo {
+    uint8_t use;
+    ULONGLONG checked;
+};
+std::unordered_map<uint32_t, ModuleInfo> g_modules;
+
+uint8_t module_use(uint32_t pid, ULONGLONG now) {
+    auto it = g_modules.find(pid);
+    if (it != g_modules.end() && now - it->second.checked < 10000) return it->second.use;
+    uint8_t use = scan_modules(pid);
+    g_modules[pid] = { use, now };
+    return use;
+}
+
 // CPU clock and thermal zone, then per-process GPU usage from the WDDM performance counters
 // (works for any GPU vendor).
 void sample_counters(Snapshot& s) {
@@ -374,20 +431,49 @@ void sample_counters(Snapshot& s) {
         s.cpu_temp_label = "ACPI";
     }
 
+    // Only hardware display adapters count; the software renderer and NPUs also show up here.
+    auto hardware = [](uint64_t luid) {
+        if (g_adapters.empty()) return true; // adapter list unavailable: keep everything
+        for (const Adapter& a : g_adapters)
+            if (a.luid == luid) return true;
+        return false;
+    };
+
     std::map<std::wstring, double> engine_util; // engine (without pid) -> summed utilization
+    std::unordered_map<uint32_t, bool> has_3d;  // pid -> has a context on a 3D engine
     pdh_each(g_gpu_engine, [&](const wchar_t* name, double v) {
         uint32_t pid;
-        if (!parse_pid(name, pid)) return;
+        if (!parse_pid(name, pid) || !hardware(parse_luid(name))) return;
+        const wchar_t* et = wcsstr(name, L"engtype_");
+        std::wstring eng = et ? et + 8 : L"";
         ProcGpu& pg = s.proc_gpu[pid];
-        pg.util = std::max(pg.util, (float)v);
+        if (_wcsnicmp(eng.c_str(), L"3D", 2) == 0) has_3d[pid] = true;
+        if (_wcsnicmp(eng.c_str(), L"Compute", 7) == 0) pg.use |= GPU_COMPUTE;
+        if ((float)v > pg.util) {
+            pg.util = (float)v;
+            if (v > 0) pg.engine = engine_label(eng);
+        }
         if (const wchar_t* luid = wcsstr(name, L"luid_")) engine_util[luid] += v;
     });
     pdh_each(g_gpu_proc_mem, [&](const wchar_t* name, double v) {
         uint32_t pid;
-        if (!parse_pid(name, pid)) return;
+        if (!parse_pid(name, pid) || !hardware(parse_luid(name))) return;
         ProcGpu& pg = s.proc_gpu[pid];
         pg.mem = std::max(pg.mem, (uint64_t)v);
     });
+
+    // Compute or graphics. WDDM gives every GPU process a 3D context (CUDA work also runs there),
+    // so the API libraries a process has loaded decide; the 3D context alone counts as graphics
+    // unless the process is known to do compute.
+    ULONGLONG now = GetTickCount64();
+    for (auto& e : s.proc_gpu) {
+        uint8_t mods = module_use(e.first, now);
+        bool compute = (e.second.use & GPU_COMPUTE) || (mods & GPU_COMPUTE);
+        bool graphics = (mods & GPU_GRAPHICS) || (has_3d.count(e.first) && !compute);
+        e.second.use = (uint8_t)((compute ? GPU_COMPUTE : 0) | (graphics ? GPU_GRAPHICS : 0));
+    }
+    for (auto it = g_modules.begin(); it != g_modules.end();) // forget processes that left the GPU
+        it = s.proc_gpu.count(it->first) ? std::next(it) : g_modules.erase(it);
 
     // An adapter's load is that of its busiest engine.
     std::map<uint64_t, double> luid_util, luid_mem;

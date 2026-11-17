@@ -3,6 +3,7 @@
 #include "sys.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdarg>
@@ -224,6 +225,26 @@ void box(Canvas& c, int x, int y, int w, int h, const std::string& title, const 
     if (!info.empty()) c.put(x + 2 + n, y, info + " ", 0, w - 4 - n);
 }
 
+// Marks the focused panel after it is drawn: its border turns cyan and its title is inverted.
+void highlight_frame(Canvas& c, int x, int y, int w, int h) {
+    const char* border[] = { G->h, G->v, G->tl, G->tr, G->bl, G->br };
+    auto mark = [&](int cx, int cy) {
+        if (cx < 0 || cy < 0 || cx >= c.w || cy >= c.h) return;
+        Canvas::Cell& cell = c.at(cx, cy);
+        bool is_border = false;
+        for (const char* b : border) is_border = is_border || strcmp(cell.ch, b) == 0;
+        cell.style = is_border ? (uint8_t)(CYAN | BOLD) : (uint8_t)(cell.style | INV);
+    };
+    for (int i = 0; i < w; i++) {
+        mark(x + i, y);
+        mark(x + i, y + h - 1);
+    }
+    for (int i = 1; i < h - 1; i++) {
+        mark(x, y + i);
+        mark(x + w - 1, y + i);
+    }
+}
+
 // Horizontal usage bar. colour 0 = by level (green / yellow / red).
 void hbar(Canvas& c, int x, int y, int w, double frac, uint8_t colour = 0) {
     if (w <= 0) return;
@@ -286,16 +307,20 @@ double recent_max(const Hist& hist, int w, double floor) {
 
 // ---------------------------------------------------------------- view model
 
-enum SortKey { S_CPU, S_MEM, S_GPU, S_VRAM, S_PID, S_NAME };
-const char* kSortNames[] = { "CPU%", "MEM", "GPU%", "VRAM", "PID", "NAME" };
-
 struct ProcRow {
     uint32_t pid;
     std::string name;
     double cpu;
     uint64_t mem;
     uint32_t threads;
-    float gpu;
+};
+
+struct GpuProcRow {
+    uint32_t pid;
+    std::string name;
+    uint8_t use; // GpuUse flags
+    float util;  // -1 = unknown
+    std::string engine;
     uint64_t vram;
 };
 
@@ -315,6 +340,7 @@ struct View {
     std::vector<double> core_frac;
     double cpu_frac = 0;
     std::vector<ProcRow> procs;
+    std::vector<GpuProcRow> gpu_procs;
     std::vector<NetRow> nets;
     std::vector<PhysRow> phys;
     double net_rx = 0, net_tx = 0, io_read = 0, io_write = 0;
@@ -335,6 +361,7 @@ double cpu_frac(const CpuTimes& now, const CpuTimes& prev) {
 void build_view(View& v, Snapshot&& now, const Snapshot& prev, double dt, bool record) {
     v.core_frac.clear();
     v.procs.clear();
+    v.gpu_procs.clear();
     v.nets.clear();
     v.phys.clear();
     v.threads = 0;
@@ -348,14 +375,16 @@ void build_view(View& v, Snapshot&& now, const Snapshot& prev, double dt, bool r
     double ncores = (double)std::max<size_t>(1, now.cores.size());
     double denom = dt * 1e7 * ncores; // 100 ns units of CPU time available in the interval
     for (auto& p : now.procs) {
-        ProcRow r { p.pid, p.name, 0, p.mem, p.threads, -1, 0 };
+        ProcRow r { p.pid, p.name, 0, p.mem, p.threads };
         auto it = prev_cpu.find(p.pid);
         if (it != prev_cpu.end() && p.cpu_time >= it->second && denom > 0)
             r.cpu = std::min(100.0, (double)(p.cpu_time - it->second) / denom * 100.0);
+        // A process is listed under the GPU when it has a GPU context, VRAM or load.
         auto g = now.proc_gpu.find(p.pid);
         if (g != now.proc_gpu.end()) {
-            r.gpu = g->second.util;
-            r.vram = g->second.mem;
+            const ProcGpu& pg = g->second;
+            if (pg.use || pg.mem || pg.util >= 0.05f)
+                v.gpu_procs.push_back({ p.pid, p.name, pg.use, pg.util, pg.engine, pg.mem });
         }
         v.threads += p.threads;
         v.procs.push_back(std::move(r));
@@ -376,8 +405,6 @@ void build_view(View& v, Snapshot&& now, const Snapshot& prev, double dt, bool r
         v.net_tx += r.tx;
         v.nets.push_back(std::move(r));
     }
-    std::stable_sort(v.nets.begin(), v.nets.end(),
-                     [](const NetRow& a, const NetRow& b) { return a.rx + a.tx > b.rx + b.tx; });
 
     std::unordered_map<std::string, const PhysDisk*> prev_phys;
     for (auto& d : prev.phys) prev_phys[d.name] = &d;
@@ -405,30 +432,189 @@ void build_view(View& v, Snapshot&& now, const Snapshot& prev, double dt, bool r
     v.snap = std::move(now);
 }
 
-void sort_procs(std::vector<ProcRow>& p, SortKey key) {
-    std::stable_sort(p.begin(), p.end(), [key](const ProcRow& a, const ProcRow& b) {
-        switch (key) {
-        case S_CPU: return a.cpu > b.cpu;
-        case S_MEM: return a.mem > b.mem;
-        case S_GPU: return a.gpu > b.gpu;
-        case S_VRAM: return a.vram > b.vram;
-        case S_PID: return a.pid < b.pid;
-        case S_NAME: return a.name < b.name;
+// ---------------------------------------------------------------- UI state
+// Every panel can take the focus (Tab, Shift+Tab, left/right). The focused panel can be zoomed to
+// the whole screen, and panels with a list have their own sort order, sort keys and scrolling.
+
+enum PanelId { P_CPU, P_PROCS, P_GPU, P_MEM, P_DISK, P_NET, P_COUNT, P_NONE = P_COUNT };
+const char* const kPanelNames[] = { "CPU", "Processes", "GPU", "Memory", "Storage", "Network" };
+
+struct SortOption {
+    char key;
+    const char* label;
+    bool high_first; // numbers start with the largest, names and PIDs with the smallest
+};
+struct SortSet {
+    const SortOption* opts;
+    int n;
+};
+const SortOption kProcSorts[] = { { 'c', "CPU%", true }, { 'm', "MEM", true }, { 't', "THR", true },
+                                  { 'p', "PID", false }, { 'n', "NAME", false } };
+const SortOption kGpuSorts[] = { { 'g', "GPU%", true }, { 'v', "VRAM", true }, { 't', "TYPE", true },
+                                 { 'p', "PID", false }, { 'n', "NAME", false } };
+const SortOption kDiskSorts[] = { { 'n', "NAME", false }, { 'u', "USED%", true }, { 's', "SIZE", true },
+                                  { 'f', "FREE", true } };
+const SortOption kNetSorts[] = { { 't', "TOTAL", true }, { 'd', "DOWN", true }, { 'u', "UP", true },
+                                 { 'n', "NAME", false } };
+
+SortSet sorts_of(PanelId p) {
+    switch (p) {
+    case P_PROCS: return { kProcSorts, 5 };
+    case P_GPU: return { kGpuSorts, 5 };
+    case P_DISK: return { kDiskSorts, 4 };
+    case P_NET: return { kNetSorts, 4 };
+    default: return { nullptr, 0 };
+    }
+}
+bool scrollable(PanelId p) { return p == P_PROCS || p == P_GPU || p == P_NET; }
+
+struct PanelState {
+    int sort = 0;         // index into the panel's SortSet
+    bool reverse = false; // opposite of the column's natural direction
+    int scroll = 0;       // first list row shown
+    int page = 1;         // list rows visible, set by render
+};
+
+struct UiState {
+    PanelId focus = P_PROCS;
+    PanelId zoom = P_NONE;
+    PanelState ps[P_COUNT];
+    std::vector<PanelId> order; // focus order = reading order on screen, set by render
+    double interval = 1.0;
+};
+
+std::string sort_label(const UiState& ui, PanelId p) {
+    SortSet s = sorts_of(p);
+    const PanelState& ps = ui.ps[p];
+    return std::string(s.opts[ps.sort].label) + (ps.reverse ? " reversed" : "");
+}
+
+bool iless(const std::string& a, const std::string& b) {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                        [](unsigned char x, unsigned char y) { return tolower(x) < tolower(y); });
+}
+
+// Sorts by the panel's chosen column. less(col, a, b) is the ascending order of column `col`.
+template <class T, class Less>
+void sort_rows(std::vector<T>& rows, PanelId p, const UiState& ui, Less less) {
+    const PanelState& ps = ui.ps[p];
+    int col = ps.sort;
+    bool desc = sorts_of(p).opts[col].high_first != ps.reverse;
+    std::stable_sort(rows.begin(), rows.end(),
+                     [&](const T& a, const T& b) { return desc ? less(col, b, a) : less(col, a, b); });
+}
+
+int type_rank(uint8_t use) { return (use & GPU_COMPUTE ? 2 : 0) + (use & GPU_GRAPHICS ? 1 : 0); }
+
+void sort_view(View& v, const UiState& ui) {
+    sort_rows(v.procs, P_PROCS, ui, [](int col, const ProcRow& a, const ProcRow& b) {
+        switch (col) {
+        case 0: return a.cpu != b.cpu ? a.cpu < b.cpu : a.mem < b.mem;
+        case 1: return a.mem < b.mem;
+        case 2: return a.threads < b.threads;
+        case 3: return a.pid < b.pid;
+        default: return iless(a.name, b.name);
         }
-        return false;
+    });
+    sort_rows(v.gpu_procs, P_GPU, ui, [](int col, const GpuProcRow& a, const GpuProcRow& b) {
+        switch (col) {
+        case 0: return a.util != b.util ? a.util < b.util : a.vram < b.vram;
+        case 1: return a.vram < b.vram;
+        case 2: return type_rank(a.use) != type_rank(b.use) ? type_rank(a.use) < type_rank(b.use) : a.vram < b.vram;
+        case 3: return a.pid < b.pid;
+        default: return iless(a.name, b.name);
+        }
+    });
+    sort_rows(v.snap.disks, P_DISK, ui, [](int col, const DiskInfo& a, const DiskInfo& b) {
+        auto used = [](const DiskInfo& d) { return d.total ? 1.0 - (double)d.free / (double)d.total : 0.0; };
+        switch (col) {
+        case 1: return used(a) < used(b);
+        case 2: return a.total < b.total;
+        case 3: return a.free < b.free;
+        default: return iless(a.mount, b.mount);
+        }
+    });
+    sort_rows(v.nets, P_NET, ui, [](int col, const NetRow& a, const NetRow& b) {
+        switch (col) {
+        case 0: return a.rx + a.tx < b.rx + b.tx;
+        case 1: return a.rx < b.rx;
+        case 2: return a.tx < b.tx;
+        default: return iless(a.name, b.name);
+        }
     });
 }
 
-struct UiState {
-    SortKey sort = S_CPU;
-    int scroll = 0;
-    double interval = 1.0;
-    int page = 10; // visible process rows, updated by render
+// Focus, zoom, sorting and scrolling keys. Returns false for keys it does not handle.
+// Sort keys belong to the focused panel; pressing the current one again reverses the order.
+bool handle_key(UiState& ui, int key) {
+    std::vector<PanelId> order = ui.order;
+    if (order.empty()) order = { P_CPU, P_PROCS, P_GPU, P_MEM, P_DISK, P_NET };
+    size_t pos = (size_t)(std::find(order.begin(), order.end(), ui.focus) - order.begin()) % order.size();
+    PanelState& ps = ui.ps[ui.focus];
+    switch (key) {
+    case '\t': case K_RIGHT:
+        ui.focus = order[(pos + 1) % order.size()];
+        break;
+    case K_BACKTAB: case K_LEFT:
+        ui.focus = order[(pos + order.size() - 1) % order.size()];
+        break;
+    case '\r': case '\n': case 'z':
+        ui.zoom = ui.zoom == P_NONE ? ui.focus : P_NONE;
+        return true;
+    case 'r':
+        if (!sorts_of(ui.focus).n) return false;
+        ps.reverse = !ps.reverse;
+        ps.scroll = 0;
+        return true;
+    default: {
+        SortSet s = sorts_of(ui.focus);
+        for (int i = 0; i < s.n; i++)
+            if (key == s.opts[i].key) {
+                ps.reverse = i == ps.sort ? !ps.reverse : false;
+                ps.sort = i;
+                ps.scroll = 0;
+                return true;
+            }
+        if (!scrollable(ui.focus)) return false;
+        switch (key) {
+        case K_UP: case 'k': ps.scroll--; break;
+        case K_DOWN: case 'j': ps.scroll++; break;
+        case K_PGUP: ps.scroll -= ps.page; break;
+        case K_PGDN: ps.scroll += ps.page; break;
+        case K_HOME: ps.scroll = 0; break;
+        case K_END: ps.scroll = 1 << 30; break; // render() clamps it to the last page
+        default: return false;
+        }
+        if (ps.scroll < 0) ps.scroll = 0;
+        return true;
+    }
+    }
+    if (ui.zoom != P_NONE) ui.zoom = ui.focus; // a zoomed screen follows the focus
+    return true;
+}
+
+// What every panel gets: the data, the UI state, and whether this is a one-shot (--once) frame.
+struct Ctx {
+    View& v;
+    UiState& ui;
+    bool full;
 };
 
 // ---------------------------------------------------------------- panels
-// Each panel has pref(view, width, g) = wanted height including the border, and
-// draw(canvas, view, x, y, w, h, g). `g` is the height of history graphs in rows (0 = none).
+// Each panel has pref(ctx, width, g) = wanted height including the border, and
+// draw(canvas, ctx, x, y, w, h, g). `g` is the height of history graphs in rows (0 = none).
+// A panel given more height than it asked for grows its graphs (or its table).
+
+// The first text that fits in `w` columns (the last one when none does), so narrow panels show
+// a shorter form instead of a clipped one.
+std::string pick(int w, std::initializer_list<std::string> options) {
+    std::string last;
+    for (const std::string& o : options) {
+        if (text_width(o) <= w) return o;
+        last = o;
+    }
+    return last;
+}
 
 double frac_of(uint64_t used, uint64_t total) { return total ? (double)used / (double)total : 0.0; }
 std::string used_of(uint64_t used, uint64_t total) { return fmt_bytes(used) + " / " + fmt_bytes(total); }
@@ -504,9 +690,13 @@ void mem_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
     int gh = g + std::max(0, h - mem_pref(v, w, g));
     meter(c, ix, row++, iw, "RAM", frac_of(s.mem_used, s.mem_total), used_of(s.mem_used, s.mem_total));
     meter(c, ix, row++, iw, s.swap_label, frac_of(s.swap_used, s.swap_total), used_of(s.swap_used, s.swap_total));
-    uint64_t avail = s.mem_total - std::min(s.mem_used, s.mem_total);
-    c.put(ix, row++, sf("Available %s   Cached %s   Used %.0f%%", fmt_bytes(avail).c_str(), fmt_bytes(s.mem_cached).c_str(),
-                        frac_of(s.mem_used, s.mem_total) * 100), GRAY, iw);
+    std::string avail = fmt_bytes(s.mem_total - std::min(s.mem_used, s.mem_total)), cached = fmt_bytes(s.mem_cached);
+    double used_pct = frac_of(s.mem_used, s.mem_total) * 100;
+    c.put(ix, row++,
+          pick(iw, { sf("Available %s   Cached %s   Used %.0f%%", avail.c_str(), cached.c_str(), used_pct),
+                     sf("Avail %s  Cached %s  Used %.0f%%", avail.c_str(), cached.c_str(), used_pct),
+                     sf("Avail %s  Cached %s", avail.c_str(), cached.c_str()) }),
+          GRAY, iw);
     graph(c, ix, row, iw, gh, v.h_mem, 1.0);
     row += gh;
     const auto& mods = sys_info().modules;
@@ -514,25 +704,35 @@ void mem_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
         const MemModule& m = mods[i];
         std::string line = sf("%-8s %5s", m.locator.c_str(), fmt_bytes(m.size).c_str());
         if (!m.type.empty()) line += " " + m.type + (m.speed > 0 ? sf("-%d", m.speed) : std::string());
-        if (!m.manufacturer.empty()) line += "  " + m.manufacturer;
-        if (!m.part.empty()) line += " " + m.part;
-        c.put(ix, row++, line, 0, iw);
+        std::string maker = m.manufacturer.empty() ? "" : "  " + m.manufacturer;
+        std::string part = m.part.empty() ? "" : " " + m.part;
+        c.put(ix, row++, pick(iw, { line + maker + part, line + maker, line }), 0, iw);
     }
 }
 
-int gpu_pref(const View& v, int, int g) { return 2 + std::max(1, (int)v.snap.gpus.size() * (3 + g)); }
+// GPU panel: gauges and history per GPU, plus a table of the processes using the GPU.
+// A wide panel puts the table to the right of the gauges, a narrow one below them.
+bool gpu_side_by_side(int w) { return w - 2 >= 90; }
+int gpu_gauges_h(const View& v, int g) { return std::max(1, (int)v.snap.gpus.size() * (3 + g)); }
+const int kGpuTableSide = 4, kGpuTableBelow = 6; // minimum table lines (header + rows)
 
-void gpu_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
+int gpu_pref(const Ctx& ctx, int w, int g) {
+    const View& v = ctx.v;
+    bool side = gpu_side_by_side(w);
+    int table = ctx.full ? 1 + std::max<int>(1, (int)v.gpu_procs.size()) : side ? kGpuTableSide : kGpuTableBelow;
+    int gauges = gpu_gauges_h(v, g);
+    return 2 + (side ? std::max(gauges, table) : gauges + table);
+}
+
+void gpu_gauges(Canvas& c, const View& v, int ix, int top, int iw, int ih, int g) {
     const Snapshot& s = v.snap;
-    box(c, x, y, w, h, "GPU");
-    c.clip(x + 1, x + w - 1);
-    int ix = x + 1, iw = w - 2, row = y + 1;
     if (s.gpus.empty()) {
-        c.put(ix, row, "no GPU data", GRAY, iw);
+        c.put(ix, top, "no GPU data", GRAY, iw);
         return;
     }
-    int gh = g + std::max(0, h - gpu_pref(v, w, g)) / (int)s.gpus.size();
-    for (size_t i = 0; i < s.gpus.size() && row + 2 < y + h - 1; i++) {
+    int row = top, bottom = top + ih;
+    int gh = g + std::max(0, ih - gpu_gauges_h(v, g)) / (int)s.gpus.size();
+    for (size_t i = 0; i < s.gpus.size() && row + 2 < bottom; i++) {
         const GpuInfo& gp = s.gpus[i];
         std::string name = gp.name;
         for (const char* prefix : { "NVIDIA GeForce ", "NVIDIA " }) // keep the model number visible
@@ -553,9 +753,81 @@ void gpu_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
         meter(c, ix, row++, iw, "Util", gp.util < 0 ? 0 : gp.util / 100.0, gp.util < 0 ? "n/a" : sf("%3d%%", gp.util));
         meter(c, ix, row++, iw, "VRAM", frac_of(gp.mem_used, gp.mem_total),
               gp.mem_total ? used_of(gp.mem_used, gp.mem_total) : fmt_bytes(gp.mem_used));
-        if (i < v.h_gpu.size()) graph(c, ix, row, iw, gh, v.h_gpu[i], 1.0);
+        if (i < v.h_gpu.size()) graph(c, ix, row, iw, std::min(gh, bottom - row), v.h_gpu[i], 1.0);
         row += gh;
     }
+}
+
+// Digits needed for the "#" column of a table with n rows.
+int index_width(size_t n) { return n >= 1000 ? 4 : n >= 100 ? 3 : 2; }
+
+// Keeps a table's first visible row in range and returns it.
+int clamp_scroll(int& scroll, int total, int rows) {
+    scroll = std::max(0, std::min(scroll, total - rows));
+    return scroll;
+}
+
+// "1-7 of 362": the rows on screen (1-based), or just the count when everything fits.
+std::string range_of(int first, int rows, int total) {
+    int last = std::min(total, first + rows);
+    if (first == 0 && last == total) return sf("%d", total);
+    return sf("%d-%d of %d", first + 1, last, total);
+}
+
+// TYPE: C = compute (CUDA, OpenCL, ...), G = graphics (Direct3D, OpenGL, Vulkan), C+G = both.
+// `first` = index of the first row shown (scrolling). "#" is the rank in the current sort order.
+// shortcut: with several GPUs the table lists the processes of all of them together.
+void gpu_table(Canvas& c, const View& v, int first, int x, int y, int w, int h) {
+    if (h < 2 || w < 20) return;
+    int n = (int)v.gpu_procs.size(), iw = index_width(v.gpu_procs.size());
+    std::string header = sf("%*s %7s  %-4s %5s  %-8s %7s  %s", iw, "#", "PID", "TYPE", "GPU%", "ENGINE", "VRAM", "NAME");
+    header.resize((size_t)std::max(w, (int)header.size()), ' ');
+    c.put(x, y, header, INV, w);
+    if (n == 0) {
+        c.put(x, y + 1, "no process is using the GPU", GRAY, w);
+        return;
+    }
+    for (int i = 0; i < h - 1 && first + i < n; i++) {
+        const GpuProcRow& p = v.gpu_procs[(size_t)(first + i)];
+        int row = y + 1 + i, cx = x;
+        cx += c.put(cx, row, sf("%*d ", iw, first + i + 1), GRAY | DIM);
+        bool comp = p.use & GPU_COMPUTE, gfx = p.use & GPU_GRAPHICS;
+        const char* type = comp && gfx ? "C+G" : comp ? "C" : gfx ? "G" : "-";
+        uint8_t type_style = comp && gfx ? YELLOW : comp ? MAGENTA : gfx ? CYAN : GRAY;
+        cx += c.put(cx, row, sf("%7u  ", p.pid), GRAY);
+        cx += c.put(cx, row, sf("%-4s ", type), type_style | BOLD);
+        cx += c.put(cx, row, sf("%5s  ", p.util < 0 ? "-" : sf("%.1f", p.util).c_str()),
+                    p.util >= 0.05f ? level(p.util / 100.0) : (uint8_t)GRAY);
+        bool busy = p.util >= 0.05f && !p.engine.empty(); // name the engine only when the load shows
+        cx += c.put(cx, row, sf("%-8s ", busy ? p.engine.c_str() : "-"), busy ? 0 : (uint8_t)GRAY);
+        cx += c.put(cx, row, sf("%7s  ", p.vram ? fmt_bytes(p.vram).c_str() : "-"), p.vram ? 0 : (uint8_t)GRAY);
+        c.put(cx, row, p.name, 0, x + w - cx);
+    }
+}
+
+void gpu_draw(Canvas& c, Ctx& ctx, int x, int y, int w, int h, int g) {
+    const View& v = ctx.v;
+    UiState& ui = ctx.ui;
+    int ix = x + 1, iw = w - 2, top = y + 1, ih = h - 2;
+    bool side = gpu_side_by_side(w);
+    int gw = side ? iw * 9 / 20 : iw;                 // gauges: left part, or full width on top
+    int gauges = side ? ih : gpu_gauges_h(v, g);
+    int tx = side ? ix + gw + 1 : ix, tw = side ? iw - gw - 1 : iw;
+    int ty = side ? top : top + gauges, th = side ? ih : ih - gauges; // table area, header included
+
+    int n = (int)v.gpu_procs.size(), rows = std::max(1, th - 1);
+    ui.ps[P_GPU].page = rows;
+    int first = clamp_scroll(ui.ps[P_GPU].scroll, n, rows);
+    box(c, x, y, w, h, "GPU", sf("%s processes, by %s", range_of(first, rows, n).c_str(), sort_label(ui, P_GPU).c_str()));
+
+    c.clip(ix, ix + gw);
+    gpu_gauges(c, v, ix, top, gw, gauges, g);
+    if (side) {
+        c.clip(ix, ix + iw);
+        for (int r = 0; r < ih; r++) c.put(ix + gw, top + r, G->v, GRAY | DIM);
+    }
+    c.clip(tx, tx + tw);
+    gpu_table(c, v, first, tx, ty, tw, th);
 }
 
 // In a narrow panel each physical drive gets two lines, so the model name is not squeezed out.
@@ -568,8 +840,9 @@ int disk_pref(const View& v, int w, int g) {
 
 void disk_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
     const Snapshot& s = v.snap;
+    std::string rd = fmt_rate(v.io_read), wr = fmt_rate(v.io_write);
     box(c, x, y, w, h, "Storage",
-        v.phys.empty() ? "" : "read " + fmt_rate(v.io_read) + "  write " + fmt_rate(v.io_write));
+        v.phys.empty() ? "" : pick(w - 15, { "read " + rd + "  write " + wr, "R " + rd + "  W " + wr, "" }));
     c.clip(x + 1, x + w - 1);
     int ix = x + 1, iw = w - 2, row = y + 1;
     int gh = g + std::max(0, h - disk_pref(v, w, g));
@@ -580,8 +853,11 @@ void disk_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
         double f = frac_of(used, d.total);
         if (two_line) {
             int n = c.put(ix, row, d.mount, BOLD | CYAN, iw);
-            c.put(ix + n + 1, row, d.fs, GRAY, iw - n - 1);
-            c.putr(ix + iw, row, sf("%s  free %s  %.0f%%", used_of(used, d.total).c_str(), fmt_bytes(d.free).c_str(), f * 100));
+            n += 1 + c.put(ix + n + 1, row, d.fs, GRAY, iw - n - 1);
+            std::string u = used_of(used, d.total);
+            c.putr(ix + iw, row,
+                   pick(iw - n - 1, { sf("%s  free %s  %.0f%%", u.c_str(), fmt_bytes(d.free).c_str(), f * 100),
+                                      sf("%s  %.0f%%", u.c_str(), f * 100), sf("%.0f%%", f * 100) }));
             row++;
             hbar(c, ix, row++, iw, f);
         } else {
@@ -619,80 +895,140 @@ void disk_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
 
 int net_pref(const View& v, int, int g) { return 2 + 2 + 2 * g + (int)std::min<size_t>(v.nets.size(), 3); }
 
-void net_draw(Canvas& c, const View& v, int x, int y, int w, int h, int g) {
-    box(c, x, y, w, h, "Network");
-    c.clip(x + 1, x + w - 1);
+void net_draw(Canvas& c, Ctx& ctx, int x, int y, int w, int h, int g) {
+    const View& v = ctx.v;
+    PanelState& ps = ctx.ui.ps[P_NET];
     int ix = x + 1, iw = w - 2, row = y + 1;
+    // Spare height (a zoomed panel) shows more interfaces first, then grows the graphs.
+    int n_if = (int)v.nets.size(), base = std::min(n_if, 3);
     int extra = std::max(0, h - net_pref(v, w, g));
+    int if_rows = std::min(n_if, base + extra / 2);
+    extra -= if_rows - base;
     int gh_rx = g + (extra + 1) / 2, gh_tx = g + extra / 2;
+    ps.page = std::max(1, if_rows);
+    int first = clamp_scroll(ps.scroll, n_if, ps.page);
+    box(c, x, y, w, h, "Network",
+        pick(w - 15, { sf("%s interfaces, by %s", range_of(first, ps.page, n_if).c_str(), sort_label(ctx.ui, P_NET).c_str()),
+                       sf("by %s", sort_label(ctx.ui, P_NET).c_str()), "" }));
+    c.clip(x + 1, x + w - 1);
     // Each graph is scaled to its own busiest moment on screen ("scale").
     double rx_max = recent_max(v.h_rx, iw, 10 * 1024.0), tx_max = recent_max(v.h_tx, iw, 10 * 1024.0);
-    c.put(ix, row, "Down " + fmt_rate(v.net_rx), GREEN | BOLD, iw);
-    c.putr(ix + iw, row++, "scale " + fmt_rate(rx_max), GRAY);
+    int n = c.put(ix, row, "Down " + fmt_rate(v.net_rx), GREEN | BOLD, iw);
+    c.putr(ix + iw, row++, pick(iw - n - 1, { "scale " + fmt_rate(rx_max), "" }), GRAY);
     graph(c, ix, row, iw, gh_rx, v.h_rx, rx_max, GREEN);
     row += gh_rx;
-    c.put(ix, row, "Up   " + fmt_rate(v.net_tx), MAGENTA | BOLD, iw);
-    c.putr(ix + iw, row++, "scale " + fmt_rate(tx_max), GRAY);
+    n = c.put(ix, row, "Up   " + fmt_rate(v.net_tx), MAGENTA | BOLD, iw);
+    c.putr(ix + iw, row++, pick(iw - n - 1, { "scale " + fmt_rate(tx_max), "" }), GRAY);
     graph(c, ix, row, iw, gh_tx, v.h_tx, tx_max, MAGENTA);
     row += gh_tx;
-    for (size_t i = 0; i < v.nets.size() && i < 3 && row < y + h - 1; i++) {
-        const NetRow& r = v.nets[i];
+    for (int i = 0; i < if_rows && first + i < n_if && row < y + h - 1; i++) {
+        const NetRow& r = v.nets[(size_t)(first + i)];
         std::string right = "rx " + fmt_rate(r.rx) + "  tx " + fmt_rate(r.tx);
         c.put(ix, row, r.name, CYAN, iw - text_width(right) - 1);
         c.putr(ix + iw, row++, right, GRAY);
     }
 }
 
-void procs_draw(Canvas& c, View& v, UiState& ui, int x, int y, int w, int h) {
-    box(c, x, y, w, h, "Processes",
-        sf("%zu tasks, %llu threads, sorted by %s", v.procs.size(), (unsigned long long)v.threads, kSortNames[ui.sort]));
-    c.clip(x + 1, x + w - 1);
+const int kProcRows = 6; // process lines when the list has a row of its own
+
+int procs_pref(const Ctx& ctx, int, int) { return 3 + (ctx.full ? (int)ctx.v.procs.size() : kProcRows); }
+
+void procs_draw(Canvas& c, Ctx& ctx, int x, int y, int w, int h, int) {
+    View& v = ctx.v;
+    UiState& ui = ctx.ui;
     int ix = x + 1, iw = w - 2;
-    int rows = h - 3; // borders + header
-    ui.page = std::max(1, rows);
-    if (rows < 1 || iw < 10) return;
-    std::string header = "    PID  CPU%     MEM  THR  GPU%    VRAM  NAME";
+    int rows = std::max(1, h - 3); // borders + header
+    int total = (int)v.procs.size();
+    ui.ps[P_PROCS].page = rows;
+    int first = clamp_scroll(ui.ps[P_PROCS].scroll, total, rows);
+    box(c, x, y, w, h, "Processes",
+        sf("%s, %llu threads, by %s", range_of(first, rows, total).c_str(), (unsigned long long)v.threads,
+           sort_label(ui, P_PROCS).c_str()));
+    c.clip(x + 1, x + w - 1);
+    if (h < 4 || iw < 10) return;
+    int nw = index_width(v.procs.size());
+    std::string header = sf("%*s %7s %5s %7s %4s  %s", nw, "#", "PID", "CPU%", "MEM", "THR", "NAME");
     header.resize((size_t)std::max(iw, (int)header.size()), ' ');
     c.put(ix, y + 1, header, INV, iw);
-    sort_procs(v.procs, ui.sort);
-    int total = (int)v.procs.size();
-    ui.scroll = std::max(0, std::min(ui.scroll, total - rows));
-    for (int i = 0; i < rows && ui.scroll + i < total; i++) {
-        const ProcRow& p = v.procs[(size_t)(ui.scroll + i)];
+    for (int i = 0; i < rows && first + i < total; i++) {
+        const ProcRow& p = v.procs[(size_t)(first + i)];
         int row = y + 2 + i, cx = ix;
+        cx += c.put(cx, row, sf("%*d ", nw, first + i + 1), GRAY | DIM);
         cx += c.put(cx, row, sf("%7u ", p.pid), GRAY);
         cx += c.put(cx, row, sf("%5.1f", p.cpu), p.cpu >= 0.05 ? level(p.cpu / 100.0) : (uint8_t)GRAY);
-        cx += c.put(cx, row, sf(" %7s %4u ", fmt_bytes(p.mem).c_str(), p.threads));
-        cx += c.put(cx, row, sf("%5s %7s  ", p.gpu < 0 ? "-" : sf("%.1f", p.gpu).c_str(), p.vram ? fmt_bytes(p.vram).c_str() : "-"),
-                    p.gpu >= 0.05f || p.vram ? 0 : (uint8_t)GRAY);
+        cx += c.put(cx, row, sf(" %7s %4u  ", fmt_bytes(p.mem).c_str(), p.threads));
         c.put(cx, row, p.name, 0, ix + iw - cx);
     }
 }
 
+// Adapters for panels that only need the data.
+template <int (*P)(const View&, int, int)>
+int pref_of(const Ctx& ctx, int w, int g) { return P(ctx.v, w, g); }
+template <void (*D)(Canvas&, const View&, int, int, int, int, int)>
+void draw_of(Canvas& c, Ctx& ctx, int x, int y, int w, int h, int g) { D(c, ctx.v, x, y, w, h, g); }
+
 struct Panel {
-    int (*pref)(const View&, int w, int g);
-    void (*draw)(Canvas&, const View&, int x, int y, int w, int h, int g);
+    PanelId id;
+    int (*pref)(const Ctx&, int w, int g);
+    void (*draw)(Canvas&, Ctx&, int x, int y, int w, int h, int g);
     int weight;  // share of the row's width
     bool major;  // gets full-height history graphs; the others get half
 };
+int net_pref_ctx(const Ctx& ctx, int w, int g) { return net_pref(ctx.v, w, g); }
 // Importance: CPU = GPU >= Memory > Storage > Network >>> Processes.
-// CPU and GPU share the top row equally; the second row is split 5 : 4 : 3.
-const Panel kCpu = { cpu_pref, cpu_draw, 1, true }, kGpu = { gpu_pref, gpu_draw, 1, true },
-            kMem = { mem_pref, mem_draw, 5, false }, kDisk = { disk_pref, disk_draw, 4, false },
-            kNet = { net_pref, net_draw, 3, false };
+const Panel kPanels[P_COUNT] = {
+    { P_CPU, pref_of<cpu_pref>, draw_of<cpu_draw>, 11, true },
+    { P_PROCS, procs_pref, procs_draw, 9, false },
+    { P_GPU, gpu_pref, gpu_draw, 1, true },
+    { P_MEM, pref_of<mem_pref>, draw_of<mem_draw>, 1, false },
+    { P_DISK, pref_of<disk_pref>, draw_of<disk_draw>, 1, false },
+    { P_NET, net_pref_ctx, net_draw, 1, false },
+};
 
-// Panels per row, most important first, depending on the terminal width.
-std::vector<std::vector<Panel>> layout(int W) {
-    if (W >= 120) return { { kCpu, kGpu }, { kMem, kDisk, kNet } };
-    if (W >= 80) return { { kCpu, kGpu }, { kMem, kDisk }, { kNet } };
-    return { { kCpu }, { kGpu }, { kMem }, { kDisk }, { kNet } };
+// Panels per row, most important first, depending on the terminal width. A one-shot frame lists
+// every process, so the list then gets a row of its own at the bottom.
+std::vector<std::vector<PanelId>> layout(int W, bool full) {
+    if (W >= 120 && !full) return { { P_CPU, P_PROCS }, { P_GPU }, { P_MEM, P_DISK, P_NET } };
+    if (W >= 80) return { { P_CPU }, { P_GPU }, { P_MEM, P_DISK, P_NET }, { P_PROCS } };
+    return { { P_CPU }, { P_GPU }, { P_MEM }, { P_DISK }, { P_NET }, { P_PROCS } };
+}
+
+// Key help for the focused panel, with its current sort column highlighted.
+void draw_footer(Canvas& c, int y, const UiState& ui) {
+    int x = 1;
+    auto seg = [&](const std::string& s, uint8_t style) { x += c.put(x, y, s, style); };
+    seg(std::string(" ") + kPanelNames[ui.focus] + " ", INV | BOLD | CYAN);
+    seg(ui.zoom == P_NONE ? "  q quit  Tab panel  Enter zoom" : "  q quit  Tab panel  Enter back", GRAY);
+    SortSet s = sorts_of(ui.focus);
+    if (s.n) {
+        seg("  sort:", GRAY);
+        for (int i = 0; i < s.n; i++) {
+            bool cur = i == ui.ps[ui.focus].sort;
+            seg(" ", 0);
+            seg(sf("%c %s", s.opts[i].key, s.opts[i].label), cur ? (uint8_t)(CYAN | BOLD) : (uint8_t)GRAY);
+        }
+        seg("  r reverse", GRAY);
+    }
+    if (scrollable(ui.focus)) seg("  arrows scroll", GRAY);
+    seg("  +/- interval", GRAY);
 }
 
 // `full` prints every process with no key help (used by --once); H is ignored then.
 std::vector<std::string> render(View& v, UiState& ui, const std::string& host, int W, int H, bool full = false) {
     const int term_w = W; // output is clipped to the real width even when the layout uses the minimum
     W = std::max(W, 40);
-    auto rows = layout(W);
+    auto ids = layout(W, full);
+    ui.order.clear();
+    for (auto& r : ids) ui.order.insert(ui.order.end(), r.begin(), r.end());
+    bool zoomed = !full && ui.zoom != P_NONE;
+    if (zoomed) ids = { { ui.zoom } };
+    std::vector<std::vector<Panel>> rows;
+    for (auto& r : ids) {
+        rows.emplace_back();
+        for (PanelId id : r) rows.back().push_back(kPanels[id]);
+    }
+    sort_view(v, ui);
+    Ctx ctx { v, ui, full };
 
     struct Placed {
         const Panel* p;
@@ -723,28 +1059,29 @@ std::vector<std::string> render(View& v, UiState& ui, const std::string& host, i
         int top = 1;
         for (size_t r = 0; r < placed.size(); r++) {
             int hmax = 0;
-            for (auto& pl : placed[r]) hmax = std::max(hmax, pl.p->pref(v, pl.w, row_g(r, g)));
+            for (auto& pl : placed[r]) hmax = std::max(hmax, pl.p->pref(ctx, pl.w, row_g(r, g)));
             heights.push_back(hmax);
             top += hmax;
         }
         return top;
     };
 
-    // The process list matters least: it gets a small fixed share when graphs of at least 2 rows
-    // still fit beside it, and otherwise only what the panels leave over. A one-shot frame has
-    // no history, so it has no graphs.
-    const int kMaxGraph = 12, kProcLines = 8;
+    // Tallest graphs that still fit above the key help line. A one-shot frame has no history,
+    // so it has no graphs. Rows left over on a very tall terminal go to the GPU panel's table,
+    // or to the zoomed panel.
+    const int kMaxGraph = 12;
     int g = 0;
-    if (!full) {
-        g = -1;
-        for (int t = kMaxGraph; t >= 2 && g < 0; t--)
-            if (measure(t) + 1 + kProcLines <= H) g = t;
-        for (int t = kMaxGraph; t >= 0 && g < 0; t--)
-            if (measure(t) + 1 <= H || t == 0) g = t;
-    }
+    if (!full)
+        for (int t = kMaxGraph; t >= 0; t--)
+            if (measure(t) + 1 <= H) {
+                g = t;
+                break;
+            }
     int top = measure(g);
-    int proc_h = full ? (int)v.procs.size() + 3 : H - top - 1;
-    if (full) H = top + proc_h;
+    if (full) H = top;
+    else
+        for (size_t r = 0; r < placed.size(); r++)
+            if ((zoomed || placed[r][0].p->id == P_GPU) && top + 1 < H) heights[r] += H - 1 - top;
 
     Canvas c(W, H);
     char clock[16] = "";
@@ -758,15 +1095,14 @@ std::vector<std::string> render(View& v, UiState& ui, const std::string& host, i
     for (size_t r = 0; r < placed.size(); r++) {
         for (auto& pl : placed[r]) {
             c.unclip();
-            pl.p->draw(c, v, pl.x, y, pl.w, heights[r], row_g(r, g));
+            pl.p->draw(c, ctx, pl.x, y, pl.w, heights[r], row_g(r, g));
+            c.unclip();
+            if (!full && pl.p->id == ui.focus) highlight_frame(c, pl.x, y, pl.w, heights[r]);
         }
         y += heights[r];
     }
     c.unclip();
-    if (proc_h >= 4) procs_draw(c, v, ui, 0, y, W, proc_h);
-    c.unclip();
-    if (!full)
-        c.put(1, H - 1, "q quit | sort: c cpu  m mem  g gpu  v vram  p pid  n name | arrows PgUp PgDn scroll | +/- interval", GRAY);
+    if (!full) draw_footer(c, H - 1, ui);
 
     std::vector<std::string> out;
     for (int i = 0; i < H; i++) out.push_back(c.row(i, term_w, full));
@@ -795,7 +1131,12 @@ void usage() {
          "  --ascii             draw with plain ASCII (for terminals that show broken boxes)\n"
          "  -h, --help          show this help\n"
          "\n"
-         "Keys: q quit, c/m/g/v/p/n sort, arrows PgUp PgDn Home End scroll, +/- interval");
+         "Keys: q quit, +/- interval\n"
+         "      Tab / Shift+Tab or left/right  move between panels (the focused one is highlighted)\n"
+         "      Enter or z                     zoom the focused panel to the whole screen, again to go back\n"
+         "      up/down PgUp PgDn Home End     scroll the focused list\n"
+         "      sort keys                      depend on the panel and are shown at the bottom;\n"
+         "                                     the same key twice, or r, reverses the order");
 }
 
 } // namespace
@@ -876,19 +1217,11 @@ int main(int argc, char** argv) {
         int wait = (int)std::chrono::duration_cast<std::chrono::milliseconds>(next - clock::now()).count();
         int key = term_read_key(std::max(0, wait));
         switch (key) {
-        case 'q': case 'Q': case 27: g_quit = 1; break;
-        case 'c': ui.sort = S_CPU; ui.scroll = 0; break;
-        case 'm': ui.sort = S_MEM; ui.scroll = 0; break;
-        case 'g': ui.sort = S_GPU; ui.scroll = 0; break;
-        case 'v': ui.sort = S_VRAM; ui.scroll = 0; break;
-        case 'p': ui.sort = S_PID; ui.scroll = 0; break;
-        case 'n': ui.sort = S_NAME; ui.scroll = 0; break;
-        case K_UP: case 'k': ui.scroll--; break;
-        case K_DOWN: case 'j': ui.scroll++; break;
-        case K_PGUP: ui.scroll -= ui.page; break;
-        case K_PGDN: ui.scroll += ui.page; break;
-        case K_HOME: ui.scroll = 0; break;
-        case K_END: ui.scroll = 1 << 30; break;
+        case 'q': case 'Q': g_quit = 1; break;
+        case 27: // Esc leaves the zoomed view first
+            if (ui.zoom != P_NONE) ui.zoom = P_NONE;
+            else g_quit = 1;
+            break;
         case '+': case '=':
             ui.interval = std::min(10.0, ui.interval * 2);
             break;
@@ -896,8 +1229,8 @@ int main(int argc, char** argv) {
             ui.interval = std::max(0.25, ui.interval / 2);
             next = clock::now();
             break;
+        default: handle_key(ui, key);
         }
-        if (ui.scroll < 0) ui.scroll = 0;
     }
     term_restore();
     return 0;

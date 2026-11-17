@@ -45,9 +45,14 @@ struct GpuInfo {
     int fan = -1;            // percent
 };
 
+// How a process uses the GPU (bit flags in ProcGpu::use).
+enum GpuUse : uint8_t { GPU_GRAPHICS = 1, GPU_COMPUTE = 2 };
+
 struct ProcGpu {
-    float util = -1; // percent, -1 = unknown
-    uint64_t mem = 0;
+    float util = -1;    // percent of the busiest engine, -1 = unknown
+    uint64_t mem = 0;   // dedicated VRAM, bytes
+    uint8_t use = 0;    // GpuUse flags, 0 = unknown
+    std::string engine; // busiest engine right now ("3D", "Compute", "Decode", ...), empty when idle
 };
 
 // One installed memory module, from the firmware (SMBIOS) tables.
@@ -101,7 +106,7 @@ void parse_smbios_memory(const uint8_t* data, size_t len, std::vector<MemModule>
 void nvml_sample(std::vector<GpuInfo>& gpus, std::unordered_map<uint32_t, ProcGpu>& procs);
 
 // Terminal layer (term.cpp)
-enum Key { K_NONE = -1, K_UP = 1000, K_DOWN, K_PGUP, K_PGDN, K_HOME, K_END, K_RESIZE };
+enum Key { K_NONE = -1, K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_BACKTAB, K_PGUP, K_PGDN, K_HOME, K_END, K_RESIZE };
 bool term_is_tty();
 void term_init();    // raw input, alternate screen, hidden cursor
 void term_restore(); // safe to call more than once
